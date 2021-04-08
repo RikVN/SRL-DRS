@@ -5,9 +5,9 @@
 Replace script: decide here which roles in the DRS we replace by roles in the SRL data
 '''
 
-import os
 import argparse
 import subprocess
+from random import randint
 from Neural_DRS.src.uts import get_drss, is_concept, load_json_dict, json_by_line, is_role
 from Neural_DRS.src.uts import between_quotes, write_list_of_lists, add_to_dict, average_list
 from Neural_DRS.src.uts import read_matching_nonmatching_clauses, delete_if_exists
@@ -28,17 +28,12 @@ def create_arg_parser():
                         help="Gold standard file, if added we immediately run counter")
     parser.add_argument("-l", "--lemmatize", action="store_true",
                         help="Lemmatize using Spacy")
+    parser.add_argument("-rf", "--reorder_file", default='', type=str,
+                        help="If added we reorder the output based on this gold standard order")
+    parser.add_argument("-k", "--key", default='predicted_srl', choices=['srl', 'predicted_srl'],
+                        type=str, help="Dict key for predictions, 'srl' means gold standard")
     args = parser.parse_args()
     return args
-
-
-def figure_out_key(srl_data):
-    '''Key for SRL is either "srl" or "predicted_srl"'''
-    if "predicted_srl" in srl_data[0]:
-        return "predicted_srl"
-    if "srl" in srl_data[0]:
-        return "srl"
-    raise ValueError('"srl" and "predicted_srl" both not present in SRL data keys')
 
 
 def run_counter(pred_file, gold_file, string):
@@ -55,13 +50,14 @@ def run_counter(pred_file, gold_file, string):
 def run_matching_counter(pred_file, gold_file):
     '''Run Counter with detailed clause matching and return the matching and non-matching clause
        in a list. We already have a function that can take an input file, so use that'''
-    if not os.path.isfile('tmp.txt'):
-        counter_call = 'python {0} -f1 {1} -f2 {2} -g {3} -prin -ms > tmp.txt' \
-                       .format(counter, pred_file, gold_file, sig_file)
-        subprocess.call(counter_call, shell=True)
-    counter_list = read_matching_nonmatching_clauses('tmp.txt')
+    # Make sure we can parallelize
+    tmp_file = 'tmp-' + str(randint(1, 1000000))
+    counter_call = 'python {0} -f1 {1} -f2 {2} -g {3} -prin -ms > {4}' \
+                    .format(counter, pred_file, gold_file, sig_file, tmp_file)
+    subprocess.call(counter_call, shell=True)
+    counter_list = read_matching_nonmatching_clauses(tmp_file)
     # Clean up tmp file
-    delete_if_exists('tmp.txt')
+    delete_if_exists(tmp_file)
     return counter_list
 
 
@@ -91,13 +87,19 @@ def read_srl_sents_and_roles(srl, srl_key):
     '''Read the SRL sentences and roles, extracting only relevant information'''
     srl_list = []
     for idx, role_list in enumerate(srl[srl_key]):
-        # For predicted_srl it isn't a list of list of lists, but just a list of lists
-        # This works for the current SRL output files of Tanja
-        for values in role_list:
-            if values[3] not in never_replace_roles:
-                # Save information as role_dic[("accept", "I")] = "Agent"
-                srl_list.append([srl["sentences"][idx][values[0]].lower(),
-                                 srl["sentences"][idx][values[1]].lower(), values[3]])
+        # Handle both list and list of lists structure with hacky try/except
+        if role_list:
+            try:
+                if role_list[3] not in never_replace_roles:
+                    # Save information as role_dic[("accept", "I")] = "Agent"
+                    srl_list.append([srl["sentences"][0][role_list[0]].lower(),
+                                     srl["sentences"][0][role_list[1]].lower(), role_list[3]])
+            except:
+                for values in role_list:
+                    if values[3] not in never_replace_roles:
+                        # Save information as role_dic[("accept", "I")] = "Agent"
+                        srl_list.append([srl["sentences"][idx][values[0]].lower(),
+                                         srl["sentences"][idx][values[1]].lower(), values[3]])
     return srl_list
 
 
@@ -148,7 +150,7 @@ def get_roles_per_box(drs):
     return role_dict
 
 
-def replace_by_srl(drs, srl, align_sets, srl_key, nlp, match_info, stats):
+def replace_by_srl(drs, srl, align_sets, srl_key, nlp, match_info, stats, exp_key):
     '''Main function in which we possibly replace an output role by a predicted role'''
     # First we save which variables introduced which concepts and the tokens
     var_conc = get_var_concepts(drs)
@@ -162,7 +164,7 @@ def replace_by_srl(drs, srl, align_sets, srl_key, nlp, match_info, stats):
     replace = {}
     for tok1, tok2, new_role in srl_list:
         # Check if we even plan to insert the role anyway
-        if new_role not in never_insert_roles:
+        if new_role not in never_insert_roles[exp_key]:
             for idx, clause in enumerate(drs):
                 ident = clause.split()[1]
                 # Only check roles that are different from to-be-inserted role
@@ -211,6 +213,24 @@ def find_matching_idx(item, full_list):
     raise ValueError("No match found")
 
 
+def flatten_list_of_list(in_l):
+    '''Flatten list of lists, if list just return'''
+    if len(in_l) > 0 and type(in_l) != list:
+        return in_l
+    else:
+        return [item for sublist in in_l for item in sublist]
+
+
+def reorder_srl(srl_data, tok_sents):
+    '''Put the SRL data in the order of the DRS file, using the tokenization'''
+    new_srl = []
+    srl_sents = [" ".join(flatten_list_of_list(srl["sentences"])) for srl in srl_data]
+    for srl, sent in zip(srl_sents, tok_sents):
+        srl_idx = find_matching_idx(" ".join(sent.split()), srl_sents)
+        new_srl.append(srl_data[srl_idx])
+    return new_srl
+
+
 def order_by_freq(stats, idx_list):
     '''Calculate simple statistics for a certain idx in stats'''
     match_dic = {}
@@ -252,7 +272,7 @@ def analyse_replacements(stats):
             print (string)
 
 
-def replace_srl_for_file(input_file, srl_data, srl_key, align_sets, gold_file, stats, nlp, output_file):
+def replace_srl_for_file(input_file, srl_data, srl_key, align_sets, gold_file, stats, nlp, output_file, exp_key):
     '''Most important function: replace SRL for a given input file'''
     drss = [clean_drs(drs) for drs in get_drss(input_file)]
     counter_list = run_matching_counter(input_file, gold_file) if gold_file else []
@@ -261,7 +281,7 @@ def replace_srl_for_file(input_file, srl_data, srl_key, align_sets, gold_file, s
     fixed_drss = []
     for idx, (drs, srl) in enumerate(zip(drss, srl_data)):
         counter_idx = counter_list[idx] if counter_list else []
-        fixed_drs, stats = replace_by_srl(drs, srl, align_sets, srl_key, nlp, counter_idx, stats)
+        fixed_drs, stats = replace_by_srl(drs, srl, align_sets, srl_key, nlp, counter_idx, stats, exp_key)
         fixed_drss.append(fixed_drs)
 
     # Write new DRSs to output file
@@ -287,11 +307,18 @@ def main():
 
     # Read in SRL data and align data sets
     srl_data = json_by_line(args.role_file)
-    srl_key = figure_out_key(srl_data)
     align_sets = [load_json_dict(align_file) for align_file in args.align_files]
+
+    # Get the experiment key for never_insert_roles from drs_config
+    exp_key = args.role_file.split('/')[-1].split('.')[0]
 
     # If we do lemmatization load spacy here, else just set to False
     nlp = spacy.load("en_core_web_sm") if args.lemmatize else False
+
+    # Maybe reorder the SRL data before we do anything
+    if args.reorder_file:
+        tok_sents = [x.strip() for x in open(args.reorder_file, 'r')]
+        srl_data = reorder_srl(srl_data, tok_sents)
 
     # Do the actual replacing here, save stats for multiple files perhaps
     # If we added a gold file, do some analysis on what type of clauses were correctly changed
@@ -299,9 +326,10 @@ def main():
     diffs = []
     before_rep = 0
     for input_file in args.input_files:
+
         before_rep = len(stats)
-        stats, diff = replace_srl_for_file(input_file, srl_data, srl_key, align_sets, args.gold_file,
-                                           stats, nlp, input_file + args.output_ext)
+        stats, diff = replace_srl_for_file(input_file, srl_data, args.key, align_sets, args.gold_file,
+                                           stats, nlp, input_file + args.output_ext, exp_key)
         diffs.append(diff)
         pr_str = "" if args.gold_file else ' ' + input_file
         print ("Total replacements{0}: {1}\n".format(pr_str, len(stats) - before_rep))
